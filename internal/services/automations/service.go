@@ -21,6 +21,7 @@ import (
 	qbt "github.com/autobrr/go-qbittorrent"
 	"github.com/rs/zerolog/log"
 
+	"github.com/autobrr/qui/internal/metrics/collector"
 	"github.com/autobrr/qui/internal/models"
 	"github.com/autobrr/qui/internal/qbittorrent"
 	"github.com/autobrr/qui/pkg/hardlink"
@@ -62,6 +63,7 @@ type Service struct {
 	activityStore             *models.AutomationActivityStore
 	trackerCustomizationStore *models.TrackerCustomizationStore
 	syncManager               *qbittorrent.SyncManager
+	metricsCollector          *collector.AutomationCollector
 
 	// keep lightweight memory of recent applications to avoid hammering qBittorrent
 	lastApplied map[int]map[string]time.Time // instanceID -> hash -> timestamp
@@ -92,6 +94,10 @@ func NewService(cfg Config, instanceStore *models.InstanceStore, ruleStore *mode
 		lastApplied:               make(map[int]map[string]time.Time),
 		lastRuleRun:               make(map[ruleKey]time.Time),
 	}
+}
+
+func (s *Service) SetMetricsCollector(metricsCollector *collector.AutomationCollector) {
+	s.metricsCollector = metricsCollector
 }
 
 // cleanupStaleEntries removes entries from lastApplied and lastRuleRun maps
@@ -343,14 +349,11 @@ func (s *Service) PreviewDeleteRule(ctx context.Context, instanceID int, rule *m
 		wouldDelete := false
 
 		if rule.Conditions != nil && rule.Conditions.Delete != nil && rule.Conditions.Delete.Enabled {
-			// Must be completed to delete
-			if torrent.Progress >= 1.0 {
-				// Evaluate condition (if no condition, match all completed)
-				if rule.Conditions.Delete.Condition == nil {
-					wouldDelete = true
-				} else {
-					wouldDelete = EvaluateConditionWithContext(rule.Conditions.Delete.Condition, torrent, evalCtx, 0)
-				}
+			// Evaluate condition (if no condition, match all)
+			if rule.Conditions.Delete.Condition == nil {
+				wouldDelete = true
+			} else {
+				wouldDelete = EvaluateConditionWithContext(rule.Conditions.Delete.Condition, torrent, evalCtx, 0)
 			}
 		}
 
@@ -526,6 +529,20 @@ func (s *Service) PreviewCategoryRule(ctx context.Context, instanceID int, rule 
 	return result, nil
 }
 
+func (s *Service) collectRuleRunMetrics(rules []*models.Automation, ruleStats map[int]*ruleRunStats, instanceName string) {
+	if s.metricsCollector == nil {
+		return
+	}
+
+	for _, rule := range rules {
+		stats := ruleStats[rule.ID]
+		if stats == nil {
+			continue
+		}
+		stats.CollectMetrics(rule, s.metricsCollector, instanceName)
+	}
+}
+
 func (s *Service) applyForInstance(ctx context.Context, instanceID int, force bool) error {
 	rules, err := s.ruleStore.ListByInstance(ctx, instanceID)
 	if err != nil {
@@ -641,6 +658,8 @@ func (s *Service) applyForInstance(ctx context.Context, instanceID int, force bo
 
 	// Process all torrents through all eligible rules
 	ruleStats := make(map[int]*ruleRunStats)
+	defer s.collectRuleRunMetrics(eligibleRules, ruleStats, instance.Name)
+
 	states := processTorrents(torrents, eligibleRules, evalCtx, s.syncManager, skipCheck, ruleStats)
 
 	if len(states) == 0 {
@@ -670,8 +689,8 @@ func (s *Service) applyForInstance(ctx context.Context, instanceID int, force bo
 				Int("pauseNoMatch", stats.PauseConditionNotMet).
 				Int("tagNoMatch", stats.TagConditionNotMet).
 				Int("tagMissingUnregisteredSet", stats.TagSkippedMissingUnregisteredSet).
-				Int("categoryNoMatchOrBlocked", stats.CategoryConditionNotMetOrBlocked).
-				Int("deleteNotCompleted", stats.DeleteNotCompleted).
+				Int("categoryNoMatch", stats.CategoryConditionNotMet).
+				Int("categoryBlocked", stats.CategoryBlocked).
 				Int("deleteNoMatch", stats.DeleteConditionNotMet).
 				Msg("automations: rule matched trackers but applied no actions")
 		}

@@ -8,6 +8,7 @@ import (
 
 	qbt "github.com/autobrr/go-qbittorrent"
 
+	"github.com/autobrr/qui/internal/metrics/collector"
 	"github.com/autobrr/qui/internal/models"
 	"github.com/autobrr/qui/internal/qbittorrent"
 )
@@ -57,10 +58,27 @@ type ruleRunStats struct {
 	TagConditionNotMet               int
 	TagSkippedMissingUnregisteredSet int
 	CategoryApplied                  int
-	CategoryConditionNotMetOrBlocked int
+	CategoryConditionNotMet          int
+	CategoryBlocked                  int
 	DeleteApplied                    int
 	DeleteConditionNotMet            int
-	DeleteNotCompleted               int
+}
+
+func (s *ruleRunStats) CollectMetrics(rule *models.Automation, metricsCollector *collector.AutomationCollector, instanceName string) {
+	metricsCollector.GetAutomationRuleRunTotal(rule.InstanceID, instanceName, rule.ID, rule.Name).Inc()
+	metricsCollector.GetAutomationRuleRunTorrentsMatchedTotal(rule.InstanceID, instanceName, rule.ID, rule.Name).Add(float64(s.MatchedTrackers))
+
+	actionPerformedMetric := metricsCollector.GetAutomationRuleRunActionTotal(rule.InstanceID, instanceName, rule.ID, rule.Name)
+	actionPerformedMetric.WithLabelValues("speed_limit").Add(float64(s.SpeedApplied))
+	actionPerformedMetric.WithLabelValues("share_limit").Add(float64(s.ShareApplied))
+	actionPerformedMetric.WithLabelValues("pause").Add(float64(s.PauseApplied))
+	actionPerformedMetric.WithLabelValues("tag").Add(float64(s.TagConditionMet))
+	actionPerformedMetric.WithLabelValues("category").Add(float64(s.CategoryApplied))
+	actionPerformedMetric.WithLabelValues("delete").Add(float64(s.DeleteApplied))
+
+	actionNotPerformedMetric := metricsCollector.GetAutomationRuleRunActionNotPerformedTotal(rule.InstanceID, instanceName, rule.ID, rule.Name)
+	actionNotPerformedMetric.WithLabelValues("tag_skipped_missing_unregistered_set").Add(float64(s.TagSkippedMissingUnregisteredSet))
+	actionNotPerformedMetric.WithLabelValues("category_blocked").Add(float64(s.CategoryBlocked))
 }
 
 func (s *ruleRunStats) totalApplied() int {
@@ -257,37 +275,38 @@ func processRuleForTorrent(rule *models.Automation, torrent qbt.Torrent, state *
 			state.category = &conditions.Category.Category
 			state.categoryIncludeCrossSeeds = conditions.Category.IncludeCrossSeeds
 		} else if stats != nil {
-			stats.CategoryConditionNotMetOrBlocked++
+			if shouldApply {
+				stats.CategoryBlocked++
+			} else {
+				stats.CategoryConditionNotMet++
+			}
 		}
 	}
 
 	// Delete
 	if conditions.Delete != nil && conditions.Delete.Enabled {
-		// Only delete completed torrents
-		if torrent.Progress < 1.0 {
+		// Safety: delete must always have an explicit condition.
+		if conditions.Delete.Condition == nil {
 			if stats != nil {
-				stats.DeleteNotCompleted++
+				stats.DeleteConditionNotMet++
 			}
-			return
-		}
-
-		shouldApply := conditions.Delete.Condition == nil ||
-			EvaluateConditionWithContext(conditions.Delete.Condition, torrent, evalCtx, 0)
-
-		if shouldApply {
-			if stats != nil {
-				stats.DeleteApplied++
+		} else {
+			shouldApply := EvaluateConditionWithContext(conditions.Delete.Condition, torrent, evalCtx, 0)
+			if shouldApply {
+				if stats != nil {
+					stats.DeleteApplied++
+				}
+				state.shouldDelete = true
+				state.deleteMode = conditions.Delete.Mode
+				if state.deleteMode == "" {
+					state.deleteMode = DeleteModeKeepFiles
+				}
+				state.deleteRuleID = rule.ID
+				state.deleteRuleName = rule.Name
+				state.deleteReason = "condition matched"
+			} else if stats != nil {
+				stats.DeleteConditionNotMet++
 			}
-			state.shouldDelete = true
-			state.deleteMode = conditions.Delete.Mode
-			if state.deleteMode == "" {
-				state.deleteMode = DeleteModeKeepFiles
-			}
-			state.deleteRuleID = rule.ID
-			state.deleteRuleName = rule.Name
-			state.deleteReason = "condition matched"
-		} else if stats != nil {
-			stats.DeleteConditionNotMet++
 		}
 	}
 }
